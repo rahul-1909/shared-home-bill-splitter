@@ -157,6 +157,9 @@ function BillSplitterApp() {
 
   // In-flight tracking for payments
   const [payingShareId, setPayingShareId] = useState<string | null>(null)
+  const [shareIdempotencyKeys, setShareIdempotencyKeys] = useState<
+    Record<string, string | undefined>
+  >({})
   const [submitting, setSubmitting] = useState<boolean>(false)
 
   // Load homes list
@@ -323,7 +326,13 @@ function BillSplitterApp() {
   const handlePayShare = async (billId: string, shareId: string) => {
     setPayingShareId(shareId)
     setActionError(null)
-    const idempotencyKey = crypto.randomUUID()
+
+    // Reuse existing idempotency key for this share if retrying, otherwise create one
+    let idempotencyKey = shareIdempotencyKeys[shareId]
+    if (!idempotencyKey) {
+      idempotencyKey = crypto.randomUUID()
+      setShareIdempotencyKeys((prev) => ({ ...prev, [shareId]: idempotencyKey }))
+    }
 
     try {
       const res = await fetchWithTimeout(`/api/bills/${billId}/shares/${shareId}/pay`, {
@@ -335,9 +344,29 @@ function BillSplitterApp() {
       })
       const data = (await res.json()) as ShareItem & { error?: string }
 
+      // Treat 409 as already paid: refetch true server state instead of scary error
+      if (res.status === 409) {
+        setShareIdempotencyKeys((prev) => {
+          const next = { ...prev }
+          delete next[shareId]
+          return next
+        })
+        if (selectedHomeId) {
+          await loadHomeDetails(selectedHomeId)
+        }
+        return
+      }
+
       if (!res.ok) {
         throw new Error(data.error || `Payment failed (HTTP ${res.status})`)
       }
+
+      // Success: clear the idempotency key for this share
+      setShareIdempotencyKeys((prev) => {
+        const next = { ...prev }
+        delete next[shareId]
+        return next
+      })
 
       // Optimistically update the share in place to paid state
       setBills((prevBills) =>
@@ -360,7 +389,14 @@ function BillSplitterApp() {
       }
     } catch (err: unknown) {
       setActionError(err instanceof Error ? err.message : 'Payment request failed')
-      // Ensure share remains unpaid on failure
+      // Refetch true server state: payment may have succeeded server-side before client failure/timeout
+      if (selectedHomeId) {
+        try {
+          await loadHomeDetails(selectedHomeId)
+        } catch {
+          // preserve primary action error
+        }
+      }
     } finally {
       setPayingShareId(null)
     }
