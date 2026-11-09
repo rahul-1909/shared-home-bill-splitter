@@ -155,3 +155,39 @@ You must understand every line you submit. We check this with your video and in 
 5. Paste the repository link and the video link in the application form.
 
 We will run `pnpm install && pnpm check && pnpm typecheck && pnpm test` on your repository.
+
+## Decisions
+
+### 1. Atomic `UPDATE ... RETURNING` for Safe Concurrency and Idempotency
+
+To prevent race conditions without complex application-level locking, payment is handled via a single conditional atomic statement:
+```sql
+UPDATE shares
+SET paid_at = ?, idempotency_key = ?
+WHERE id = ? AND bill_id = ? AND paid_at IS NULL
+RETURNING id, member_id, amount_cents, paid_at;
+```
+If a row is returned, payment succeeded atomically. If no row is returned, the share is examined:
+- If the existing share has the identical `idempotency_key`, the original result is returned with `200 OK` (idempotent replay).
+- If the existing share was paid with a different key, `409 Conflict` is returned.
+- If the share or bill does not exist, `404 Not Found` is returned.
+  This eliminates read-then-write windows entirely, ensuring two concurrent payment requests can never both succeed.
+
+### 2. Snapshot-Based Calculation in TypeScript with Atomic `DB.batch`
+
+When a bill is created, the split is computed in application code from a single snapshot of the home's members. The exact share amounts are calculated in TypeScript so the shares are guaranteed to sum to `totalCents` before any row is written. Then, the bill insertion and all calculated share insertions are submitted together in a single Cloudflare D1 `c.env.DB.batch(statements)` call. D1 executes this batch within an atomic SQLite transaction, ensuring the bill plus all shares are all-or-nothing.
+
+### 3. Strict Integer Cents and Deterministic Remainder Sequencing
+
+Floating-point arithmetic introduces IEEE-754 precision inaccuracies. All monetary values are strictly represented and validated as integer cents (`total_cents`, `amount_cents` with `Number.isSafeInteger(val) && val > 0`). Remainder division is handled deterministically: `base = Math.floor(total / N)` and `rem = total % N`. The first `rem` members in the order of their arrival (`position`) receive `base + 1` cents, and the rest receive `base`. This guarantees that the sum of shares is invariant and always equal to `totalCents`.
+
+## How to run
+
+```bash
+pnpm install       # Install dependencies across all workspaces
+pnpm dev           # Start both API (:8787) and Web (:5173) concurrently
+pnpm test          # Run all Vitest suites against Cloudflare D1
+pnpm check         # Check code formatting and lint rules (Biome)
+pnpm typecheck     # Typecheck all TypeScript code
+pnpm build         # Production build of the web application
+```
